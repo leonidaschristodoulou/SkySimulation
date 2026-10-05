@@ -77,7 +77,7 @@ def apply_galactic_mask(T_map, Q_map, U_map, nside, mask_path=None, lat_cut_deg=
     # 1. Load or Generate the Mask
     if mask_path:
         # Load mask and force it to match the simulation nside
-        mask = hp.read_map(mask_path, verbose=False)
+        mask = hp.read_map(mask_path)
         if hp.npix2nside(len(mask)) != nside:
             mask = hp.ud_grade(mask, nside)
     elif lat_cut_deg:
@@ -116,7 +116,7 @@ def new_resolution_mask(mask_path, target_nside=256, threshold=0.9):
     
     # 1. Read the high-res mask (Planck is usually nside=2048)
     # field=0 is usually the intensity mask. If using a Pol mask, check field indices.
-    mask_high_res = hp.read_map(mask_path, verbose=False) 
+    mask_high_res = hp.read_map(mask_path) 
     
     # 2. Downgrade to your simulation nside
     # This creates values between 0.0 and 1.0 at the edges
@@ -148,16 +148,16 @@ def save_cmb_polarization_maps(
     # Note: synfast expects inputs in the order: TT, EE, BB, TE, EB, TB
     T_map, Q_map, U_map = hp.synfast(
         [cl_tt, cl_ee, cl_bb, cl_te, cl_eb, cl_tb], 
-        nside=nside, new=True, pol=True, verbose=False
+        nside=nside, new=True, pol=True
     )
 
     # 2. Smooth (Beam convolution)
     if custom_smooth:
         np.random.seed(seed0)
         fwhm_rad = np.radians(fwhm_arcmin / 60)
-        T_map = hp.smoothing(T_map, fwhm=fwhm_rad, verbose=False)
-        Q_map = hp.smoothing(Q_map, fwhm=fwhm_rad, verbose=False)
-        U_map = hp.smoothing(U_map, fwhm=fwhm_rad, verbose=False)
+        T_map = hp.smoothing(T_map, fwhm=fwhm_rad)
+        Q_map = hp.smoothing(Q_map, fwhm=fwhm_rad)
+        U_map = hp.smoothing(U_map, fwhm=fwhm_rad)
 
     # 3. Apply Mask (NEW STEP)
     # We apply the mask *after* smoothing to simulate real observation 
