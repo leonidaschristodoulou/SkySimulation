@@ -76,6 +76,12 @@ GATE_SHARD = 1000                                    # skies per gates shard (ha
 #   null2: a second, independent null (2026-10-19). The 10,000-sky null did not fix the 0.1% threshold of the
 #          global statistic stably (holdout/gate checks), so thresholds are to be set from the pooled null.
 EXTENSIONS = {"null2": (700_000, 30_000, "E", 1000, 6_000_000)}
+# Anomaly extensions: name -> (first absolute index, {anomaly: (amplitudes, N twins)}); injected on the null twins
+# like §3a, so the evaluator pairs them with the same view seeds.
+#   combo: alignment and hemispherical asymmetry on one sky (2026-10-19), at the amplitudes of the single sets
+#          they are compared with (alignment α = 1, hemispherical A = 0.07 along the Planck axis).
+ANOMALY_EXTENSIONS = {"combo": (740_000, {"combo_phase": ([1.0], 2000)})}
+COMBOS = {"combo_phase": [("alignment", 1.0), ("hemi_planckdir", 0.07)]}   # injected in this order (the PoC's)
 K_NEG, L_DEV_RANGE = 4, (2, 10)                      # hard negatives per training sky
 
 # Anomalies (§3a, §3c): file -> {anomaly: (amplitudes, N twins)}; twins are null skies 0..N-1
@@ -310,6 +316,13 @@ def injection_hook(anomaly, amp, rng):
     if anomaly == "cold_spot":
         d = ls.random_direction(rng)
         return (lambda t: ls.inject_cold_spot(t, amp, d)), {"dir_x": d[0], "dir_y": d[1], "dir_z": d[2]}
+    if anomaly in COMBOS:          # amp is a level label; the parts and their amplitudes are fixed in COMBOS
+        parts = [injection_hook(a, x, rng) for a, x in COMBOS[anomaly]]
+        def hook(t):
+            for h, _ in parts:
+                t = h(t)
+            return t
+        return hook, {k: v for _, m in parts for k, v in m.items()}
     if anomaly == "modulation_L2-10":
         L_dev = int(rng.integers(L_DEV_RANGE[0], L_DEV_RANGE[1] + 1))
         M = ls.random_modulation_field(L_dev, rng)
@@ -405,9 +418,9 @@ def run(args):
         if name == "train":
             res.update(delta=np.stack([o[3] for o in out]), M_alm=np.stack([o[4] for o in out]),
                        L_dev=np.stack([o[5] for o in out]))
-    elif kind == "anomalies":
+    elif kind in ("anomalies", "anomalies_ext"):
         null = pd.read_csv(OUT_DIR / "plan" / "params_null.csv")
-        an = pd.read_csv(OUT_DIR / "plan" / "anomalies.csv")
+        an = pd.read_csv(OUT_DIR / "plan" / ("anomalies.csv" if kind == "anomalies" else f"anomalies_{name}.csv"))
         an = an[(an.null_index >= lo) & (an.null_index < hi)]
         jobs = [(null.iloc[i].to_dict(), [r.to_dict() for _, r in g.iterrows()]) for i, g in an.groupby("null_index")]
         with pool() as ex:
@@ -582,7 +595,8 @@ def extend(args):
     cfg = json.loads((out / "config.json").read_text())
     ext = cfg.setdefault("extensions", {})
     todo = [k for k in EXTENSIONS if k not in ext]
-    if not todo:
+    todo_anom = [k for k in ANOMALY_EXTENSIONS if k not in ext]
+    if not todo and not todo_anom:
         print("all extensions planned"); return
     used = np.concatenate([pd.read_csv(f).real_seed.to_numpy() for f in sorted((out / "plan").glob("params_*.csv"))]
                           + [pd.read_csv(out / "plan" / "controls.csv").real_seed.to_numpy()])
@@ -603,12 +617,35 @@ def extend(args):
         ext[name] = {"first": first, "n": n, "chain_half": half, "view_seed_base": view_base,
                      "sha256": hashlib.sha256(f.read_bytes()).hexdigest(), "planned": time.strftime("%Y-%m-%d"),
                      "git": {"commit": git("rev-parse", "HEAD"), "dirty": bool(git("status", "--porcelain", "--", "."))}}
+    planned_idx = np.concatenate([pd.read_csv(out / "plan" / "anomalies.csv").abs_index.to_numpy()]
+                                 + [pd.read_csv(f).abs_index.to_numpy() for f in (out / "plan").glob("anomalies_*.csv")])
+    for name in todo_anom:
+        first, spec = ANOMALY_EXTENSIONS[name]
+        rows, k = [], first
+        for anomaly, (amps, n_twins) in spec.items():
+            for amp in amps:
+                for i in range(n_twins):
+                    rows.append({"file": f"anomalies_{name}", "key": f"{anomaly}__{amp:g}", "anomaly": anomaly,
+                                 "amplitude": amp, "null_index": i, "abs_index": k})
+                    k += 1
+        df = pd.DataFrame(rows)
+        assert not np.isin(df.abs_index, planned_idx).any(), f"{name}: absolute indices overlap the suite"
+        f = out / "plan" / f"anomalies_{name}.csv"
+        df.to_csv(f, index=False)
+        n_tw = int(df.null_index.max()) + 1
+        per = max(ANOM_TWINS_PER_SHARD, 400 // df.key.nunique())   # few skies per twin: larger shards
+        tasks += [{"kind": "anomalies_ext", "set": name, "lo": lo, "hi": min(lo + per, n_tw)} for lo in range(0, n_tw, per)]
+        ext[name] = {"kind": "anomalies", "first": first, "sets": {a: {"amplitudes": am, "n_twins": n}
+                                                                   for a, (am, n) in spec.items()},
+                     "combos": {a: COMBOS[a] for a in spec if a in COMBOS},
+                     "sha256": hashlib.sha256(f.read_bytes()).hexdigest(), "planned": time.strftime("%Y-%m-%d"),
+                     "git": {"commit": git("rev-parse", "HEAD"), "dirty": bool(git("status", "--porcelain", "--", "."))}}
     for j, t in enumerate(tasks):
         t["task"] = j
     pd.DataFrame(tasks).to_csv(tasks_path, index=False)
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
     shutil.copy(__file__, out / "generate_suite.py")
-    print(f"planned {todo}: {len(tasks)} extension tasks -> {tasks_path}")
+    print(f"planned {todo + todo_anom}: {len(tasks)} extension tasks -> {tasks_path}")
 
 
 def merge_ext(args):
@@ -618,6 +655,8 @@ def merge_ext(args):
     cfg = json.loads((out / "config.json").read_text())
     tasks = pd.read_csv(out / "plan" / "tasks_ext.csv", keep_default_na=False)
     for name, e in cfg.get("extensions", {}).items():
+        if e.get("kind") == "anomalies":
+            merge_anomaly_ext(out, name, e, tasks); continue
         f = out / "plan" / f"params_{name}.csv"
         assert hashlib.sha256(f.read_bytes()).hexdigest() == e["sha256"], f"plan file {f.name} changed"
         if (out / f"lcdm_{name}.npz").exists():
@@ -638,6 +677,29 @@ def merge_ext(args):
         pd.DataFrame({"key": f"{name}__0", "anomaly": name, "amplitude": 0.0, "abs_index": idx,
                       "null_index": e["view_seed_base"] + np.arange(len(idx))}).to_csv(out / f"anomalies_{name}_meta.csv", index=False)
         print(f"lcdm_{name}.npz + anomalies_{name}.npz: {len(idx)} skies")
+
+
+def merge_anomaly_ext(out, name, e, tasks):
+    """Shards of an anomaly extension -> anomalies_<name>.npz (keys "<anomaly>__<amp>", rows sorted by null_index,
+    the evaluator's order) and anomalies_<name>_meta.csv."""
+    f = out / "plan" / f"anomalies_{name}.csv"
+    assert hashlib.sha256(f.read_bytes()).hexdigest() == e["sha256"], f"plan file {f.name} changed"
+    if (out / f"anomalies_{name}.npz").exists():
+        print(f"anomalies_{name}.npz exists, skipping"); return
+    paths = [out / "shards" / f"{name}_{t.task:03d}.npz" for t in tasks[tasks["set"] == name].itertuples()]
+    missing = [p.name for p in paths if not p.exists()]
+    if missing:
+        raise SystemExit(f"{name}: {len(missing)} shards missing, e.g. {missing[:3]}")
+    parts = [np.load(p) for p in paths]
+    idx, alm = np.concatenate([q["abs_index"] for q in parts]), np.concatenate([q["alm"] for q in parts])
+    meta = pd.concat([pd.read_json(io.StringIO(str(q["meta_json"])), orient="records") for q in parts], ignore_index=True)
+    an = pd.read_csv(f).merge(meta, on="abs_index", how="left")
+    pos = pd.Series(np.arange(len(idx)), index=idx)
+    assert len(idx) == len(an) and pos.index.is_unique and set(idx) == set(an.abs_index), name
+    an = an.sort_values(["key", "null_index"])
+    np.savez(out / f"anomalies_{name}.npz", **{k: alm[pos[g.abs_index].to_numpy()] for k, g in an.groupby("key", sort=False)})
+    an.drop(columns="file").to_csv(out / f"anomalies_{name}_meta.csv", index=False)
+    print(f"anomalies_{name}.npz: {an.key.nunique()} keys, {len(an)} skies")
 
 
 def main():
